@@ -1,0 +1,20 @@
+workers=$(oc get nodes -l node-role.kubernetes.io/worker \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+for n in $workers; do
+  echo "=== Rebooting $n via oc debug ==="
+  oc adm cordon "$n"
+  oc adm drain "$n" --ignore-daemonsets --delete-emptydir-data --grace-period=60 --timeout=20m
+
+  # Reboot from within the host namespace
+  oc debug node/"$n" -- chroot /host systemctl reboot || { echo "debug reboot failed for $n"; exit 1; }
+
+  echo "Waiting for $n to come back Ready..."
+  oc wait node/"$n" --for=condition=Ready --timeout=20m
+
+  oc adm uncordon "$n"
+  echo "=== $n is back ==="
+done
+
+oc get nodes
+oc get co

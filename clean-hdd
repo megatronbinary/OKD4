@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage: sudo ./wipe-sdb.sh /dev/sdX [quick|zero|random]
+#   quick  : remove partition tables & filesystem signatures only
+#   zero   : full zero-fill of the entire disk (default for HDD)
+#   random : full 1-pass random overwrite
+#
+# Examples:
+#   sudo ./wipe-sdb.sh /dev/sdb           # zero-fill + zap (recommended)
+#   sudo ./wipe-sdb.sh /dev/sdb quick     # fast metadata wipe only
+#   sudo ./wipe-sdb.sh /dev/sdb random    # 1 random pass + zap
+
+DEV=${1:-}
+MODE=${2:-zero}
+
+if [[ -z "${DEV}" ]]; then
+  echo "Usage: $0 /dev/sdX [quick|zero|random]" >&2
+  exit 1
+fi
+
+if [[ ! -b "${DEV}" ]]; then
+  echo "ERROR: ${DEV} is not a block device" >&2
+  exit 1
+fi
+
+# Safety checks
+ROOT_SRC=$(findmnt -no SOURCE / || true)
+ROOT_DISK="/dev/$(lsblk -ndo pkname "${ROOT_SRC}" 2>/dev/null || true)"
+if [[ -n "${ROOT_DISK}" && "${ROOT_DISK}" == "${DEV}" ]]; then
+  echo "ERROR: ${DEV} appears to be the root/boot disk! Aborting." >&2
+  exit 1
+fi
+
+echo "[i] Target device: ${DEV}"
+lsblk -d -o NAME,SIZE,MODEL,ROTA "${DEV}"
+
+# Ensure nothing is mounted/swap/RAID/LVM on this device
+echo "[i] Unmounting any partitions on ${DEV}…"
+for p in $(lsblk -ln "${DEV}" | awk '{print "/dev/"$1}'); do
+  # swap off if needed
+  if grep -q "^${p} " /proc/swaps 2>/dev/null; then
+    echo "  - swapoff ${p}"
+    swapoff "${p}" || true
+  fi
+  # unmount if mounted
+  if findmnt -no TARGET "${p}" >/dev/null 2>&1; then
+    echo "  - umount -f ${p}"
+    umount -f "${p}" || true
+  fi
+done
+
+# Try to stop any mdadm arrays using this disk (best-effort)
+if command -v mdadm >/dev/null 2>&1; then
+  echo "[i] Checking for mdadm arrays…"
+  for md in /dev/md/* /dev/md*; do
+    [[ -e "$md" ]] || continue
+    if mdadm --detail "$md" 2>/dev/null | grep -q "$(basename "${DEV}")"; then
+      echo "  - stopping array $md"
+      mdadm --stop "$md" || true
+    fi
+  done
+fi
+
+# Deactivate any LVM VGs that include this PV (best-effort)
+if command -v pvs >/dev/null 2>&1; then
+  echo "[i] Checking for LVM…"
+  while read -r vg pv; do
+    [[ "$pv" == "$DEV" ]] || continue
+    echo "  - vgchange -an $vg"
+    vgchange -an "$vg" || true
+  done < <(pvs --noheadings -o vg_name,pv_name 2>/dev/null | awk '{$1=$1};1')
+fi
+
+# Remove filesystem/RAID/LVM signatures from the disk and any existing partitions
+echo "[i] Wiping filesystem/RAID/LVM signatures…"
+wipefs -a "${DEV}" || true
+for p in $(lsblk -ln "${DEV}" | awk '{print "/dev/"$1}'); do
+  wipefs -a "$p" || true
+done
+
+# Remove GPT/MBR (primary & backup headers)
+if command -v sgdisk >/dev/null 2>&1; then
+  echo "[i] Zapping GPT/MBR with sgdisk…"
+  sgdisk --zap-all "${DEV}" || true
+else
+  echo "[i] sgdisk not found; clearing first/last 10MiB with dd…"
+  dd if=/dev/zero of="${DEV}" bs=1M count=10 conv=fsync status=progress
+  SZ=$(blockdev --getsz "${DEV}")
+  dd if=/dev/zero of="${DEV}" bs=512 seek=$((SZ-20480)) count=20480 conv=fsync status=progress
+fi
+
+# Full-disk overwrite (for HDD)
+case "${MODE}" in
+  quick)
+    echo "[i] Quick mode selected: metadata wiped only."
+    ;;
+  zero)
+    echo "[i] Zero-filling entire disk (this can take HOURS for 20 TB)…"
+    dd if=/dev/zero of="${DEV}" bs=16M oflag=direct,dsync iflag=fullblock status=progress
+    ;;
+  random)
+    echo "[i] Random 1-pass overwrite (this is VERY slow on 20 TB)…"
+    dd if=/dev/urandom of="${DEV}" bs=8M oflag=direct iflag=fullblock status=progress
+    ;;
+  *)
+    echo "ERROR: Unknown mode '${MODE}'. Use quick|zero|random." >&2
+    exit 1
+    ;;
+esac
+
+# Final signature wipe (in case dd recreated a protective GPT)
+echo "[i] Final signature wipe…"
+wipefs -a "${DEV}" || true
+if command -v sgdisk >/dev/null 2>&1; then
+  sgdisk --zap-all "${DEV}" || true
+fi
+
+sync
+echo "[✓] ${DEV} has been cleaned."
+lsblk "${DEV}"
